@@ -1,0 +1,268 @@
+image: php:latest
+
+#identifying stages
+stages:
+  - build
+  - code check
+  - test
+  - pre_release
+
+
+
+
+
+
+
+   #####################################################################
+   ############################## BUILD ################################
+   ######################################################################
+
+
+
+#Build Yii2 Application
+Build_Application:
+  stage: build
+  script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libonig-dev libxml2-dev
+    - docker-php-ext-install pdo pdo_mysql zip
+    - curl -sS https://getcomposer.org/installer | php
+    - mv composer.phar /usr/local/bin/composer
+    #Build Application
+    - composer install
+    #Set up the test database
+    - php yii migrate --interactive=0
+  cache:
+    key: build-${CI_COMMIT_REF_SLUG}
+    paths:
+      - vendor/
+
+
+
+
+#Build Docker Image Using Kaniko
+Build_Image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  before_script:
+    # Create a Docker configuration file for Kaniko using GitLab CI variables
+    - apt-get update && apt-get install -y ca-certificates curl
+    - echo "Docker build"
+    - echo "$HARBOR_HOST"
+    - echo "$HARBOR_USERNAME"
+    - echo "$HARBOR_PASSWORD"
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${HARBOR_HOST}\":{\"auth\":\"$(echo -n ${HARBOR_USERNAME}:${HARBOR_PASSWORD} | base64 | tr -d "\n")\"}}}" > /kaniko/.docker/config.json
+  script:
+    - echo "$HARBOR_CA_CERT" > /kaniko/ssl/certs/ca-certificates.crt
+   # - cat /kaniko/ssl/certs/ca-certificates.crt
+   # - cat /kaniko/.docker/config.json
+   # - curl -vvvv https://index.docker.io
+   # - openssl s_client -showcerts -connect index.docker.io:443 </dev/null
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${HARBOR_HOST}/library/yii2do:latest"
+      --skip-tls-verify
+      --insecure
+
+
+
+
+     ###############################################################
+     ######################### CODE_CHECK ##########################
+     ###############################################################
+
+
+#Code Style
+CodeStyle:
+  stage: code check
+  before_script:
+    - apt-get update && apt-get install wget -y
+    - wget https://squizlabs.github.io/PHP_CodeSniffer/phpcs.phar
+  script:
+    - echo "FULL REPORT ---------------------------------------------"
+    - php phpcs.phar --extensions=php --report=full --colors --standard=PSR2 --ignore=vendor  tests/
+  allow_failure: true
+
+
+#Linting job
+Linting:
+  stage: code check
+  script:
+    - find . -type f -name "*.php" -exec php -l {} \;
+  allow_failure: true
+
+
+#PHP Copy/Paste Detector Stage
+Duplication:
+  stage: code check
+  script:
+    - apt-get update && apt-get install wget -y
+    - wget https://phar.phpunit.de/phpcpd.phar
+    - php phpcpd.phar --min-tokens=100 .
+  allow_failure: true
+
+
+#Magic Number
+Magic_Numbers:
+  stage: code check
+  before_script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libonig-dev libxml2-dev
+    - docker-php-ext-install pdo pdo_mysql zip
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - composer require --dev povils/phpmnd
+  script:
+    - vendor/bin/phpmnd  .
+  allow_failure: true
+
+
+#PHPStan (Static Analysis)
+Static_Analysis:
+  stage: code check
+  before_script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libonig-dev libxml2-dev
+    - docker-php-ext-install pdo pdo_mysql zip
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - docker-php-ext-install zip
+    - composer require --dev phpstan/phpstan
+  script:
+    - php -d memory_limit=1G vendor/bin/phpstan analyse .
+  allow_failure: true
+
+
+
+
+
+
+   ################################################################
+   ############################# TEST #############################
+   ################################################################
+
+
+#Static Application Security Testing (SAST)
+SAST:
+  stage: test
+  image: semgrep/semgrep
+  script:
+    - semgrep ci
+
+
+
+#Dynamic Application Security Testing (DAST)
+DAST:
+  stage: test
+  image:  registry.gitlab.com/gitlab-org/security-products/zaproxy:latest
+  variables:
+    website: "http://192.168.100.97:31253/"
+  allow_failure: true
+  script:
+    - mkdir /zap/wrk/
+    - /zap/zap-baseline.py -J gl-dast-report.json -t $website || true
+    - cp /zap/wrk/gl-dast-report.json .
+  artifacts:
+    paths: [gl-dast-report.json]
+
+
+
+#Dynamic Application Security Testing (DAST)
+Dast:
+  stage: test
+  image: owasp/zap2docker-stable
+  variables:
+    APPLICATION_URL: "http://192.168.100.97:31253"
+    ZAP_URL: "http://localhost:8080"
+  services:
+    - name: docker:dind
+      command: ["--experimental"]
+  script:
+    - php -S 0.0.0.0:8000 -t public &
+    - sleep 10 # Wait for the PHP server to start
+    - zap-baseline.py -t $APPLICATION_URL -r zap-report.html
+  artifacts:
+    paths:
+      - zap-report.html
+
+
+
+
+
+
+#Unit Testing 
+PHP_UnitTesting:
+  stage: test
+  before_script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libonig-dev libxml2-dev
+    - docker-php-ext-install pdo pdo_mysql zip
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - composer install
+  script:
+    - vendor/bin/phpunit --colors=always --testdox  tests/
+  cache:
+    key: build-${CI_COMMIT_REF_SLUG}
+    paths:
+      - vendor/
+  allow_failure: true
+
+
+
+#   ############################  ABONDEND ###################################
+#PHP Testability
+#Testability:
+#  stage: test
+#  before_script:
+#    - apt-get update && apt-get install -y git unzip libzip-dev libonig-dev libxml2-dev
+#    - docker-php-ext-install pdo pdo_mysql zip
+#    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+#    - composer require --dev edsonmedina/php_testability:dev-master 
+#  script:
+#    - php vendor/bin/testability . -x vendor,tmp,upload,config -o report
+#     ############################ ABONDEND ####################################
+
+
+
+#PHP Metrics
+PHP_Metrics:
+  stage: test
+  before_script:
+    - apt-get update && apt-get install -y git unzip libzip-dev libonig-dev libxml2-dev
+    - docker-php-ext-install pdo pdo_mysql zip
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - composer global require --dev 'phpmetrics/phpmetrics'
+  script:
+    - /root/.composer/vendor/phpmetrics/phpmetrics/bin/phpmetrics  --report-html=myrepot.html ./*
+  allow_failure: true
+                       ################################################################################
+                       ############################### PRE RELEASE ####################################                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #PHP Documentation
+Php_Docs:
+ stage: pre_release
+ before_script:
+   - apt-get update && apt-get install -y wget
+   - mkdir -p docs/phpdocs
+   - wget http://phpdoc.org/phpDocumentor.phar
+ script:
+   - php phpDocumentor.phar -d . -t docs/phpdocs
+ artifacts:
+   expire_in: 1 month
+   paths:
+      - docs/phpdocs/
+
+
+#UML Diagram
+Php_Uml_iagram:
+  stage: pre_release
+  before_script:
+    - mkdir -p docs/uml
+    - apt-get update && apt-get install curl -y
+    - curl -JL -o phar-composer.phar https://clue.engineering/phar-composer-latest.phar
+  script:
+    - php phar-composer.phar ph-puml
+    -  php ph-puml.phar
+  artifacts:
+    expire_in: 1 month
+    # Define what to output from the job.
+    paths:
+      - docs/uml/
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       274,0-1       Bot
+
